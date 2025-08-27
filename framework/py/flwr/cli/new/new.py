@@ -14,9 +14,13 @@
 # ==============================================================================
 """Flower command line interface `new` command."""
 
-
+import io
+import json
 import re
+import requests
+import zipfile
 from enum import Enum
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 from string import Template
 from typing import Annotated, Optional
@@ -29,6 +33,9 @@ from ..utils import (
     prompt_text,
     sanitize_project_name,
 )
+
+
+PLATFORM_API_URL = "https://api.flower.ai"
 
 
 class MlFramework(str, Enum):
@@ -56,6 +63,11 @@ class LlmChallengeName(str, Enum):
 
 class TemplateNotFound(Exception):
     """Raised when template does not exist."""
+
+
+def _get_flwr_version() -> str:
+    """Get flwr version."""
+    return importlib_metadata.version("flwr")
 
 
 def load_template(name: str) -> str:
@@ -91,6 +103,144 @@ def render_and_create(file_path: Path, template: str, context: dict[str, str]) -
     create_file(file_path, content)
 
 
+# Security: prevent zip-slip
+def _safe_extract_zip(zf: zipfile.ZipFile, dest_dir: Path) -> None:
+    dest_dir = dest_dir.resolve()
+
+    def _is_within_directory(base: Path, target: Path) -> bool:
+        try:
+            target.relative_to(base)
+            return True
+        except ValueError:
+            return False
+
+    for member in zf.infolist():
+        # Skip directory placeholders; ZipInfo can represent them as names ending with '/'
+        if member.is_dir():
+            target_path = (dest_dir / member.filename).resolve()
+            if not _is_within_directory(dest_dir, target_path):
+                raise ValueError(f"Unsafe path in zip: {member.filename}")
+            target_path.mkdir(parents=True, exist_ok=True)
+            continue
+
+        # Files
+        target_path = (dest_dir / member.filename).resolve()
+        if not _is_within_directory(dest_dir, target_path):
+            raise ValueError(f"Unsafe path in zip: {member.filename}")
+
+        # Ensure parent exists
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Extract
+        with zf.open(member, "r") as src, open(target_path, "wb") as dst:
+            dst.write(src.read())
+
+
+def _download_zip_to_memory(presigned_url: str) -> io.BytesIO:
+    try:
+        # stream=False to pull fully into memory in one go; or stream=True and collect chunks
+        r = requests.get(presigned_url, timeout=60)
+        r.raise_for_status()
+    except requests.RequestException as e:
+        raise typer.BadParameter(f"ZIP download failed: {e}") from e
+
+    buf = io.BytesIO(r.content)
+    # Validate it's a zip
+    if not zipfile.is_zipfile(buf):
+        raise typer.BadParameter("Downloaded file is not a valid ZIP")
+    buf.seek(0)
+    return buf
+
+
+def _request_download_link(identifier: str) -> str:
+    url = f"{PLATFORM_API_URL}/hub"
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    body = {
+        "identifier": identifier,             # send raw string of identifier
+        "flwr_version": _get_flwr_version(),  # send flwr version
+    }
+
+    try:
+        resp = requests.post(url, headers=headers, data=json.dumps(body), timeout=20)
+    except requests.RequestException as e:
+        raise typer.BadParameter(f"Failed to reach platform API: {e}") from e
+
+    if resp.status_code == 401:
+        raise typer.BadParameter("Unauthorized: check FLWR_PLATFORM_API_TOKEN")
+    if resp.status_code == 404:
+        raise typer.BadParameter("Remote app not found")
+    if not resp.ok:
+        raise typer.BadParameter(f"Platform API error: {resp.status_code} {resp.text}")
+
+    data = resp.json()
+    if "url" not in data:
+        raise typer.BadParameter("Bad response from platform API (missing 'url')")
+    return data["url"]
+
+
+def download_remote_app_via_api(identifier: str) -> None:
+    # Parse @user/app just to derive local dir name
+    m = re.match(r"^@(?P<user>[^/]+)/(?P<app>[^/]+)$", identifier)
+    if not m:
+        raise typer.BadParameter("Remote app id must look like '@user_name/app_name'.")
+    app_name = m.group("app")
+
+    project_dir = Path.cwd() / app_name
+    if project_dir.exists():
+        if not typer.confirm(
+            typer.style(
+                f"\n💬 {app_name} already exists, do you want to override it?",
+                fg=typer.colors.MAGENTA,
+                bold=True,
+            )
+        ):
+            return
+
+    print(
+        typer.style(
+            f"\n🔗 Requesting download link for {identifier}…",
+            fg=typer.colors.GREEN,
+            bold=True,
+        )
+    )
+    presigned_url = _request_download_link(identifier)
+
+    print(
+        typer.style(
+            f"⬇️  Downloading ZIP into memory…",
+            fg=typer.colors.GREEN,
+            bold=True,
+        )
+    )
+    zip_buf = _download_zip_to_memory(presigned_url)
+
+    print(
+        typer.style(
+            f"📦 Unpacking into ./{app_name} …",
+            fg=typer.colors.GREEN,
+            bold=True,
+        )
+    )
+    with zipfile.ZipFile(zip_buf) as zf:
+        _safe_extract_zip(zf, project_dir)
+
+    print(
+        typer.style(
+            "\n🎊 Flower App download successful.\n\n"
+            "To run your Flower App, first install its dependencies:\n\n"
+            f"\tcd {app_name} && pip install -e .\n\n"
+            "then, run the app:\n\n"
+            "\tflwr run .\n\n"
+            "💡 Check the README in your app directory for usage details.\n",
+            fg=typer.colors.GREEN,
+            bold=True,
+        )
+    )
+
+
 # pylint: disable=too-many-locals,too-many-branches,too-many-statements
 def new(
     app_name: Annotated[
@@ -109,6 +259,12 @@ def new(
     """Create new Flower App."""
     if app_name is None:
         app_name = prompt_text("Please provide the app name")
+
+    # Download remote app from FlowerHub
+    if app_name and app_name.startswith("@"):
+        download_remote_app_via_api(app_name)
+        return
+
     if not is_valid_project_name(app_name):
         app_name = prompt_text(
             "Please provide a name that only contains "
