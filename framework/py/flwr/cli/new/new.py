@@ -138,7 +138,6 @@ def _safe_extract_zip(zf: zipfile.ZipFile, dest_dir: Path) -> None:
 
 def _download_zip_to_memory(presigned_url: str) -> io.BytesIO:
     try:
-        # stream=False to pull fully into memory in one go; or stream=True and collect chunks
         r = requests.get(presigned_url, timeout=60)
         r.raise_for_status()
     except requests.RequestException as e:
@@ -168,8 +167,6 @@ def _request_download_link(identifier: str) -> str:
     except requests.RequestException as e:
         raise typer.BadParameter(f"Failed to reach platform API: {e}") from e
 
-    if resp.status_code == 401:
-        raise typer.BadParameter("Unauthorized: check FLWR_PLATFORM_API_TOKEN")
     if resp.status_code == 404:
         raise typer.BadParameter("Remote app not found")
     if not resp.ok:
